@@ -1,0 +1,12 @@
+pandas
+numpy
+openpyxl
+scipy
+ortools
+geopy
+streamlit
+plotly
+folium
+streamlit-folium
+pytest
+pytest-cov
