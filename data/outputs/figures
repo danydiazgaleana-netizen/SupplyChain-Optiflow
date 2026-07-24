@@ -1,0 +1,534 @@
+"""
+Script de simulación de jornada de operador logístico con horario real,
+pausa de almuerzo fija y costo de oportunidad derivado de tiempos reales.
+Incluye visualizaciones con Matplotlib y Seaborn para análisis de resultados.
+"""
+
+import numpy as np
+import pandas as pd
+from datetime import datetime, timedelta
+import os
+import random
+import re
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+import seaborn as sns
+
+# ---------------------------
+# CONFIGURACIÓN
+# ---------------------------
+SEED = 42
+np.random.seed(SEED)
+random.seed(SEED)
+
+# Turno oficial
+TURNO_INICIO = datetime.strptime("07:00", "%H:%M")
+TURNO_FIN = datetime.strptime("17:00", "%H:%M")
+HORAS_TURNO = (TURNO_FIN - TURNO_INICIO).total_seconds() / 3600
+
+# Almuerzo fijo (innegociable)
+ALMUERZO_INICIO = datetime.strptime("12:00", "%H:%M")
+ALMUERZO_FIN = datetime.strptime("12:30", "%H:%M")
+DURACION_ALMUERZO = (ALMUERZO_FIN - ALMUERZO_INICIO).total_seconds() / 60
+
+# Llegada anticipada (sin goce de sueldo, solo si se requiere)
+LLEGADA_ANTICIPADA = datetime.strptime("06:30", "%H:%M")
+HORAS_EFECTIVAS = HORAS_TURNO - (DURACION_ALMUERZO / 60)
+
+# Parámetros de fricción (minutos)
+TIEMPO_MONTACARGAS_MIN = 3.0
+TIEMPO_MONTACARGAS_MAX = 12.0
+TIEMPO_RETRABAJO_MIN = 5.0
+TIEMPO_RETRABAJO_MAX = 20.0
+TIEMPO_ESPACIO_MIN = 2.0
+TIEMPO_ESPACIO_MAX = 10.0
+PROB_ESPACIO_BLOQUEADO = 0.15
+
+# Factores de automatización
+FACTOR_REDUCCION_MONTACARGAS = 0.5
+FACTOR_REDUCCION_RETRABAJO = 0.1
+
+N_PEDIDOS = 50
+
+# ---------------------------
+# 1. GENERACIÓN DE DATOS CRUDOS
+# ---------------------------
+def generar_datos_crudos(n):
+    """Genera DataFrame con datos crudos incluyendo errores típicos."""
+    data = []
+    for i in range(n):
+        if i > 0 and np.random.random() < 0.1:
+            id_pedido = data[-1]['ID_Pedido']
+        else:
+            id_pedido = f"PED-{i+1:04d}"
+        
+        tipo_opciones = ["VL", "PEGE", "Exportacion", "VL ", "PEGE ", "Exportacion ", "ERROR"]
+        tipo = np.random.choice(tipo_opciones, p=[0.4, 0.25, 0.15, 0.05, 0.05, 0.05, 0.05])
+        
+        cantidad = np.random.randint(-5, 60)
+        if cantidad < 0:
+            cantidad = 0
+        
+        fecha_base = datetime.now() - timedelta(days=np.random.randint(0, 30))
+        if np.random.random() < 0.15:
+            fecha_str = "fecha invalida"
+        elif np.random.random() < 0.1:
+            fecha_str = fecha_base.strftime("%d/%m/%Y")
+        else:
+            fecha_str = fecha_base.strftime("%Y-%m-%d")
+        
+        if np.random.random() < 0.08:
+            horas_est = np.nan
+        else:
+            horas_est = round(np.random.uniform(0.1, 5.0), 2)
+        
+        if np.random.random() < 0.05:
+            tasa_error = "N/A"
+        else:
+            tasa_error = round(np.random.beta(2, 5), 3)
+        
+        data.append({
+            "ID_Pedido": id_pedido,
+            "Tipo": tipo,
+            "Cantidad_Items": cantidad,
+            "Fecha_Llegada": fecha_str,
+            "Horas_Estimadas_Proceso": horas_est,
+            "Tasa_Error_Administrativo": tasa_error
+        })
+    
+    df_raw = pd.DataFrame(data)
+    duplicados = df_raw.sample(frac=0.05, random_state=SEED)
+    df_raw = pd.concat([df_raw, duplicados], ignore_index=True)
+    df_raw = df_raw.sample(frac=1, random_state=SEED).reset_index(drop=True)
+    return df_raw
+
+# ---------------------------
+# 2. PIPELINE ETL
+# ---------------------------
+def etl_pipeline(df_raw):
+    """Limpia y valida los datos crudos."""
+    df = df_raw.copy()
+    df.columns = [col.strip() for col in df.columns]
+    
+    metricas = {
+        "filas_iniciales": len(df),
+        "duplicados_eliminados": 0,
+        "valores_corregidos": 0,
+        "filas_finales": 0
+    }
+    
+    df['ID_Pedido'] = df['ID_Pedido'].astype(str).str.strip().str.upper()
+    duplicados = df.duplicated(subset=['ID_Pedido', 'Tipo', 'Cantidad_Items'], keep='first')
+    metricas["duplicados_eliminados"] = duplicados.sum()
+    df = df[~duplicados].reset_index(drop=True)
+    
+    def estandarizar_tipo(t):
+        if isinstance(t, str):
+            t_clean = t.strip().upper()
+            if t_clean in ["VL", "PEGE", "EXPORTACION"]:
+                return t_clean
+            elif t_clean.startswith("VL"):
+                return "VL"
+            elif "PEGE" in t_clean:
+                return "PEGE"
+            elif "EXPORT" in t_clean:
+                return "Exportacion"
+        return "Otro"
+    
+    df['Tipo'] = df['Tipo'].apply(estandarizar_tipo)
+    conteo_otros = (df['Tipo'] == "Otro").sum()
+    metricas["valores_corregidos"] += conteo_otros
+    
+    if conteo_otros > 0:
+        tipos_validos = ["VL", "PEGE", "Exportacion"]
+        probabilidades = [0.50, 0.35, 0.15]
+        reemplazos = np.random.choice(tipos_validos, size=conteo_otros, p=probabilidades)
+        df.loc[df['Tipo'] == "Otro", 'Tipo'] = reemplazos
+    
+    def corregir_cantidad(val):
+        try:
+            val_int = int(val)
+            return max(0, val_int)
+        except:
+            return 0
+    df['Cantidad_Items'] = df['Cantidad_Items'].apply(corregir_cantidad)
+    metricas["valores_corregidos"] += (df['Cantidad_Items'] == 0).sum()
+    
+    def parse_fecha(fecha_str):
+        if isinstance(fecha_str, str):
+            fecha_str = fecha_str.strip()
+            for fmt in ["%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y"]:
+                try:
+                    return datetime.strptime(fecha_str, fmt)
+                except:
+                    continue
+            match = re.search(r'\d{4}-\d{2}-\d{2}', fecha_str)
+            if match:
+                try:
+                    return datetime.strptime(match.group(), "%Y-%m-%d")
+                except:
+                    pass
+        return datetime.now()
+    df['Fecha_Llegada'] = df['Fecha_Llegada'].apply(parse_fecha)
+    
+    def corregir_horas(val):
+        try:
+            h = float(val)
+            return max(0.1, h) if h >= 0 else 0.5
+        except:
+            return 0.5
+    df['Horas_Estimadas_Proceso'] = df['Horas_Estimadas_Proceso'].apply(corregir_horas)
+    metricas["valores_corregidos"] += (df['Horas_Estimadas_Proceso'] == 0.5).sum()
+    
+    def corregir_tasa(val):
+        try:
+            t = float(val)
+            if t < 0 or t > 1:
+                return 0.2
+            return min(t, 0.4)
+        except:
+            return 0.2
+    df['Tasa_Error_Administrativo'] = df['Tasa_Error_Administrativo'].apply(corregir_tasa)
+    metricas["valores_corregidos"] += (df['Tasa_Error_Administrativo'] == 0.2).sum()
+    
+    df = df[df['ID_Pedido'].notna() & (df['ID_Pedido'] != '')]
+    df = df[df['Tipo'].isin(["VL", "PEGE", "Exportacion"])]
+    df.reset_index(drop=True, inplace=True)
+    metricas["filas_finales"] = len(df)
+    return df, metricas
+
+# ---------------------------
+# 3. SIMULACIÓN DE JORNADA
+# ---------------------------
+def simular_jornada(df_clean, automatizado=False):
+    df = df_clean.copy()
+    df = df.sort_values('Fecha_Llegada').reset_index(drop=True)
+    minutos_llegada = np.random.uniform(0, 120, size=len(df))
+    df['Llegada'] = [TURNO_INICIO + timedelta(minutes=m) for m in minutos_llegada]
+    
+    df['Tiempo_Montacargas'] = 0.0
+    df['Tiempo_Retrabajo'] = 0.0
+    df['Tiempo_Espacio'] = 0.0
+    df['Tiempo_Ciclo_Real'] = 0.0
+    df['Hora_Inicio'] = None
+    df['Hora_Fin'] = None
+    
+    reloj = TURNO_INICIO
+    tiempo_trabajado = timedelta(0)
+    
+    factor_mont = FACTOR_REDUCCION_MONTACARGAS if automatizado else 1.0
+    factor_retrab = FACTOR_REDUCCION_RETRABAJO if automatizado else 1.0
+    
+    def avanzar_con_pausa(reloj_actual, minutos_trabajo):
+        tiempo_restante = timedelta(minutes=minutos_trabajo)
+        while tiempo_restante > timedelta(0):
+            if ALMUERZO_INICIO <= reloj_actual < ALMUERZO_FIN:
+                reloj_actual = ALMUERZO_FIN
+                continue
+            if reloj_actual < ALMUERZO_INICIO and reloj_actual + tiempo_restante > ALMUERZO_INICIO:
+                trabajo_hasta_almuerzo = ALMUERZO_INICIO - reloj_actual
+                reloj_actual += trabajo_hasta_almuerzo
+                tiempo_restante -= trabajo_hasta_almuerzo
+                reloj_actual = ALMUERZO_FIN
+                continue
+            reloj_actual += tiempo_restante
+            tiempo_restante = timedelta(0)
+        return reloj_actual
+    
+    for idx, row in df.iterrows():
+        t_base = row['Horas_Estimadas_Proceso'] * 60
+        t_mont = np.random.uniform(TIEMPO_MONTACARGAS_MIN, TIEMPO_MONTACARGAS_MAX) * factor_mont
+        if np.random.random() < row['Tasa_Error_Administrativo'] * factor_retrab:
+            t_retrab = np.random.uniform(2, 5) if automatizado else np.random.uniform(TIEMPO_RETRABAJO_MIN, TIEMPO_RETRABAJO_MAX)
+        else:
+            t_retrab = 0.0
+        if np.random.random() < PROB_ESPACIO_BLOQUEADO:
+            t_espacio = np.random.uniform(TIEMPO_ESPACIO_MIN, TIEMPO_ESPACIO_MAX)
+            if automatizado:
+                t_espacio *= 0.7
+        else:
+            t_espacio = 0.0
+        
+        t_ciclo = t_base + t_mont + t_retrab + t_espacio
+        df.at[idx, 'Tiempo_Montacargas'] = t_mont
+        df.at[idx, 'Tiempo_Retrabajo'] = t_retrab
+        df.at[idx, 'Tiempo_Espacio'] = t_espacio
+        df.at[idx, 'Tiempo_Ciclo_Real'] = t_ciclo
+        
+        if reloj < row['Llegada']:
+            reloj = row['Llegada']
+        hora_inicio = reloj
+        reloj = avanzar_con_pausa(reloj, t_ciclo)
+        hora_fin = reloj
+        df.at[idx, 'Hora_Inicio'] = hora_inicio
+        df.at[idx, 'Hora_Fin'] = hora_fin
+        tiempo_trabajado += timedelta(minutes=t_ciclo)
+    
+    tiempo_total_requerido = reloj - TURNO_INICIO
+    excede_turno = reloj > TURNO_FIN
+    horas_extra = max(timedelta(0), reloj - TURNO_FIN) if excede_turno else timedelta(0)
+    llegada_colapso = LLEGADA_ANTICIPADA if excede_turno else None
+    
+    total_montacargas = df['Tiempo_Montacargas'].sum() / 60.0
+    total_retrabajo = df['Tiempo_Retrabajo'].sum() / 60.0
+    total_espacio = df['Tiempo_Espacio'].sum() / 60.0
+    total_friccion = total_montacargas + total_retrabajo + total_espacio
+    total_base = df['Horas_Estimadas_Proceso'].sum()
+    total_ciclo = df['Tiempo_Ciclo_Real'].sum() / 60.0
+    
+    return {
+        'df_pedidos': df,
+        'reloj_final': reloj,
+        'tiempo_trabajado': tiempo_trabajado,
+        'tiempo_total_requerido': tiempo_total_requerido,
+        'excede_turno': excede_turno,
+        'horas_extra': horas_extra,
+        'llegada_colapso': llegada_colapso,
+        'total_montacargas_h': total_montacargas,
+        'total_retrabajo_h': total_retrabajo,
+        'total_espacio_h': total_espacio,
+        'total_friccion_h': total_friccion,
+        'total_base_h': total_base,
+        'total_ciclo_h': total_ciclo,
+        'automatizado': automatizado
+    }
+
+# ---------------------------
+# 4. CÁLCULO DE COSTO DE OPORTUNIDAD
+# ---------------------------
+def calcular_costo_oportunidad(resultado_manual, resultado_auto):
+    ciclo_manual = resultado_manual['total_ciclo_h']
+    ciclo_auto = resultado_auto['total_ciclo_h']
+    ahorro_ciclo = ciclo_manual - ciclo_auto
+    friccion_manual = resultado_manual['total_friccion_h']
+    friccion_auto = resultado_auto['total_friccion_h']
+    ahorro_friccion = friccion_manual - friccion_auto
+    trabajo_manual = resultado_manual['tiempo_trabajado'].total_seconds() / 3600
+    trabajo_auto = resultado_auto['tiempo_trabajado'].total_seconds() / 3600
+    ahorro_trabajo = trabajo_manual - trabajo_auto
+    costo_hora = 15.0
+    ahorro_dinero = ahorro_ciclo * costo_hora
+    return {
+        "ciclo_manual_h": round(ciclo_manual, 2),
+        "ciclo_auto_h": round(ciclo_auto, 2),
+        "ahorro_ciclo_h": round(ahorro_ciclo, 2),
+        "friccion_manual_h": round(friccion_manual, 2),
+        "friccion_auto_h": round(friccion_auto, 2),
+        "ahorro_friccion_h": round(ahorro_friccion, 2),
+        "trabajo_manual_h": round(trabajo_manual, 2),
+        "trabajo_auto_h": round(trabajo_auto, 2),
+        "ahorro_trabajo_h": round(ahorro_trabajo, 2),
+        "ahorro_dinero_usd": round(ahorro_dinero, 2)
+    }
+
+# ---------------------------
+# 5. VISUALIZACIONES
+# ---------------------------
+def generar_visualizaciones(resultado_manual, resultado_auto, costo_op):
+    """
+    Genera gráficos:
+      - Diagrama de Gantt para escenarios manual y automatizado.
+      - Boxplot de tiempos de ciclo por tipo de pedido.
+      - Barras comparativas de fricción total y horas extra.
+      - Evolución del reloj a lo largo del día.
+    """
+    # Crear carpeta de figuras
+    fig_dir = 'data/outputs/figures'
+    os.makedirs(fig_dir, exist_ok=True)
+    
+    # Estilos
+    sns.set_style("whitegrid")
+    plt.rcParams['figure.figsize'] = (12, 8)
+    plt.rcParams['font.size'] = 10
+    
+    # ---------- 1. Diagrama de Gantt ----------
+    fig, axes = plt.subplots(2, 1, figsize=(14, 10), sharex=True)
+    escenarios = [('Manual', resultado_manual), ('Automatizado', resultado_auto)]
+    
+    for ax, (label, res) in zip(axes, escenarios):
+        df = res['df_pedidos'].copy()
+        # Ordenar por hora de inicio
+        df = df.sort_values('Hora_Inicio')
+        # Colores por tipo
+        color_map = {'VL': 'skyblue', 'PEGE': 'lightgreen', 'Exportacion': 'salmon'}
+        for idx, row in df.iterrows():
+            inicio = row['Hora_Inicio']
+            fin = row['Hora_Fin']
+            duracion = (fin - inicio).total_seconds() / 60.0  # minutos
+            ax.barh(row['ID_Pedido'], duracion, left=(inicio - TURNO_INICIO).total_seconds()/60.0,
+                    color=color_map.get(row['Tipo'], 'gray'), edgecolor='black', linewidth=0.5)
+        # Marcar almuerzo
+        ax.axvspan((ALMUERZO_INICIO - TURNO_INICIO).total_seconds()/60.0,
+                   (ALMUERZO_FIN - TURNO_INICIO).total_seconds()/60.0,
+                   alpha=0.2, color='red', label='Almuerzo')
+        ax.set_title(f'Diagrama de Gantt - Escenario {label}')
+        ax.set_xlabel('Minutos desde inicio de turno (07:00)')
+        ax.set_ylabel('Pedido')
+        ax.grid(axis='x', linestyle='--', alpha=0.7)
+        # Leyenda de tipos
+        patches = [mpatches.Patch(color=color, label=tipo) for tipo, color in color_map.items()]
+        patches.append(mpatches.Patch(color='red', alpha=0.2, label='Almuerzo'))
+        ax.legend(handles=patches, loc='upper right')
+        # Límites del turno
+        ax.axvline(0, color='black', linestyle='-', linewidth=0.5)
+        ax.axvline((TURNO_FIN - TURNO_INICIO).total_seconds()/60.0, color='black', linestyle='-', linewidth=0.5, label='Fin turno')
+        # Marcar si excede
+        if res['excede_turno']:
+            ax.axvline((res['reloj_final'] - TURNO_INICIO).total_seconds()/60.0, color='red', linestyle='--', linewidth=1, label='Colapso')
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(fig_dir, 'gantt_chart.png'), dpi=150)
+    plt.close()
+    
+    # ---------- 2. Boxplot de tiempos de ciclo por tipo ----------
+    df_manual = resultado_manual['df_pedidos'].copy()
+    df_auto = resultado_auto['df_pedidos'].copy()
+    df_manual['Escenario'] = 'Manual'
+    df_auto['Escenario'] = 'Automatizado'
+    df_combined = pd.concat([df_manual, df_auto], ignore_index=True)
+    
+    fig, ax = plt.subplots(figsize=(10, 6))
+    sns.boxplot(data=df_combined, x='Tipo', y='Tiempo_Ciclo_Real', hue='Escenario', palette='Set2')
+    ax.set_title('Distribución de tiempos de ciclo por tipo de pedido')
+    ax.set_ylabel('Tiempo de ciclo (minutos)')
+    ax.set_xlabel('Tipo de pedido')
+    ax.grid(axis='y', linestyle='--', alpha=0.7)
+    plt.tight_layout()
+    plt.savefig(os.path.join(fig_dir, 'ciclo_por_tipo.png'), dpi=150)
+    plt.close()
+    
+    # ---------- 3. Barras comparativas de fricción y horas extra ----------
+    # Preparar datos
+    metricas = {
+        'Fricción total': [resultado_manual['total_friccion_h'], resultado_auto['total_friccion_h']],
+        'Horas extra': [resultado_manual['horas_extra'].total_seconds()/3600,
+                        resultado_auto['horas_extra'].total_seconds()/3600]
+    }
+    df_barras = pd.DataFrame(metricas, index=['Manual', 'Automatizado'])
+    
+    fig, ax = plt.subplots(figsize=(10, 6))
+    df_barras.plot(kind='bar', ax=ax, color=['#1f77b4', '#ff7f0e'])
+    ax.set_title('Comparativa de fricción y horas extra')
+    ax.set_ylabel('Horas')
+    ax.set_xlabel('Escenario')
+    ax.legend(title='Métrica')
+    ax.grid(axis='y', linestyle='--', alpha=0.7)
+    for container in ax.containers:
+        ax.bar_label(container, fmt='%.2f', padding=3)
+    plt.tight_layout()
+    plt.savefig(os.path.join(fig_dir, 'comparativa_friccion_extra.png'), dpi=150)
+    plt.close()
+    
+    # ---------- 4. Evolución del reloj (carga acumulada) ----------
+    # Extraer hora de inicio de cada pedido en minutos desde inicio de turno
+    df_manual['Inicio_min'] = (df_manual['Hora_Inicio'] - TURNO_INICIO).dt.total_seconds() / 60.0
+    df_auto['Inicio_min'] = (df_auto['Hora_Inicio'] - TURNO_INICIO).dt.total_seconds() / 60.0
+    # Ordenar por inicio
+    df_manual = df_manual.sort_values('Inicio_min')
+    df_auto = df_auto.sort_values('Inicio_min')
+    # Calcular tiempo acumulado de trabajo (suma de ciclos)
+    df_manual['Carga_acumulada'] = df_manual['Tiempo_Ciclo_Real'].cumsum()
+    df_auto['Carga_acumulada'] = df_auto['Tiempo_Ciclo_Real'].cumsum()
+    
+    fig, ax = plt.subplots(figsize=(12, 6))
+    ax.plot(df_manual['Inicio_min'], df_manual['Carga_acumulada'], label='Manual', marker='o', linestyle='-', markersize=4)
+    ax.plot(df_auto['Inicio_min'], df_auto['Carga_acumulada'], label='Automatizado', marker='s', linestyle='-', markersize=4)
+    # Líneas de referencia
+    ax.axhline(HORAS_EFECTIVAS * 60, color='red', linestyle='--', label='Límite turno (9.5h)')
+    ax.axvspan((ALMUERZO_INICIO - TURNO_INICIO).total_seconds()/60.0,
+               (ALMUERZO_FIN - TURNO_INICIO).total_seconds()/60.0,
+               alpha=0.2, color='gray', label='Almuerzo')
+    ax.set_xlabel('Minutos desde inicio de turno (07:00)')
+    ax.set_ylabel('Carga de trabajo acumulada (minutos)')
+    ax.set_title('Evolución de la carga de trabajo acumulada')
+    ax.legend()
+    ax.grid(True, linestyle='--', alpha=0.6)
+    plt.tight_layout()
+    plt.savefig(os.path.join(fig_dir, 'carga_acumulada.png'), dpi=150)
+    plt.close()
+    
+    print(f"Visualizaciones guardadas en: {fig_dir}")
+
+# ---------------------------
+# 6. REPORTE EN CONSOLA Y CSV
+# ---------------------------
+def generar_reporte(df_raw, df_clean, metricas_etl, costo_op, resultado_manual, resultado_auto):
+    output_dir = 'data/outputs'
+    os.makedirs(output_dir, exist_ok=True)
+    
+    df_manual = resultado_manual['df_pedidos'].copy()
+    df_auto = resultado_auto['df_pedidos'].copy()
+    
+    df_compare = df_clean.copy()
+    df_compare['Tiempo_Ciclo_Manual'] = df_manual['Tiempo_Ciclo_Real']
+    df_compare['Tiempo_Ciclo_Automatizado'] = df_auto['Tiempo_Ciclo_Real']
+    df_compare['Ahorro_Tiempo_Ciclo'] = df_compare['Tiempo_Ciclo_Manual'] - df_compare['Tiempo_Ciclo_Automatizado']
+    df_compare['Excede_Turno_Manual'] = df_manual['Hora_Fin'] > TURNO_FIN
+    df_compare['Excede_Turno_Auto'] = df_auto['Hora_Fin'] > TURNO_FIN
+    
+    columnas = ['ID_Pedido', 'Tipo', 'Cantidad_Items', 'Horas_Estimadas_Proceso',
+                'Tasa_Error_Administrativo', 'Tiempo_Ciclo_Manual', 'Tiempo_Ciclo_Automatizado',
+                'Ahorro_Tiempo_Ciclo', 'Excede_Turno_Manual', 'Excede_Turno_Auto']
+    df_export = df_compare[columnas].copy()
+    csv_path = os.path.join(output_dir, 'reporte_automatizacion_operativa.csv')
+    df_export.to_csv(csv_path, index=False, encoding='utf-8-sig')
+    
+    print("=" * 70)
+    print("REPORTE DE AUTOMATIZACIÓN OPERATIVA - ALMACÉN")
+    print("=" * 70)
+    print("\n--- PROCESO ETL ---")
+    print(f"Filas iniciales: {metricas_etl['filas_iniciales']}")
+    print(f"Duplicados eliminados: {metricas_etl['duplicados_eliminados']}")
+    print(f"Valores corregidos: {metricas_etl['valores_corregidos']}")
+    print(f"Filas finales: {metricas_etl['filas_finales']}")
+    
+    print("\n--- COSTO DE OPORTUNIDAD ---")
+    print(f"Tiempo de ciclo MANUAL: {costo_op['ciclo_manual_h']} h")
+    print(f"Tiempo de ciclo AUTOMATIZADO: {costo_op['ciclo_auto_h']} h")
+    print(f"Ahorro en ciclo: {costo_op['ahorro_ciclo_h']} h/día")
+    print(f"Ahorro económico: ${costo_op['ahorro_dinero_usd']}/día")
+    print(f"Fricción manual: {costo_op['friccion_manual_h']} h")
+    print(f"Fricción automatizada: {costo_op['friccion_auto_h']} h")
+    print(f"Ahorro en fricción: {costo_op['ahorro_friccion_h']} h")
+    
+    print("\n--- IMPACTO EN JORNADA ---")
+    for label, res in [('Manual', resultado_manual), ('Automatizado', resultado_auto)]:
+        print(f"\n{label}:")
+        print(f"  Hora final: {res['reloj_final'].strftime('%H:%M')}")
+        print(f"  Excede turno: {res['excede_turno']}")
+        if res['excede_turno']:
+            extra_seg = res['horas_extra'].total_seconds()
+            print(f"  Horas extra: {int(extra_seg//3600)}h {int((extra_seg%3600)//60)}m")
+            print(f"  Llegada anticipada: {res['llegada_colapso'].strftime('%H:%M')}")
+        print(f"  Tiempo en fricción: {res['total_friccion_h']:.2f} h")
+    
+    print("\n--- REDUCCIÓN DE PEDIDOS EN RIESGO ---")
+    exceden_manual = df_compare['Excede_Turno_Manual'].sum()
+    exceden_auto = df_compare['Excede_Turno_Auto'].sum()
+    print(f"Manual: {exceden_manual} pedidos exceden el turno")
+    print(f"Automatizado: {exceden_auto} pedidos exceden el turno")
+    print(f"Reducción: {exceden_manual - exceden_auto} pedidos")
+    print(f"\nReporte CSV: {csv_path}")
+
+# ---------------------------
+# EJECUCIÓN PRINCIPAL
+# ---------------------------
+if __name__ == "__main__":
+    print("Generando datos crudos...")
+    df_raw = generar_datos_crudos(N_PEDIDOS)
+    print("Aplicando ETL...")
+    df_clean, metricas_etl = etl_pipeline(df_raw)
+    print("Simulando jornada MANUAL...")
+    resultado_manual = simular_jornada(df_clean, automatizado=False)
+    print("Simulando jornada AUTOMATIZADA...")
+    resultado_auto = simular_jornada(df_clean, automatizado=True)
+    print("Calculando costo de oportunidad...")
+    costo_op = calcular_costo_oportunidad(resultado_manual, resultado_auto)
+    
+    # Generar reporte en consola y CSV
+    generar_reporte(df_raw, df_clean, metricas_etl, costo_op, resultado_manual, resultado_auto)
+    
+    # Generar visualizaciones
+    print("\nGenerando visualizaciones...")
+    generar_visualizaciones(resultado_manual, resultado_auto, costo_op)
+    print("Proceso completado.")
